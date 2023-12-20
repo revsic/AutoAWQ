@@ -24,15 +24,15 @@ class MixtralBlock(nn.Module):
         self, hidden_states, past_key_value, attn_bias=None, attention_mask=None, is_causal=None
     ):
         norm_out = self.norm_1(hidden_states)
-        attn_output, _, past_key_value = self.attn.forward(
+        out, _, past_key_value = self.attn.forward(
             hidden_states=norm_out,
             past_key_value=past_key_value,
             attention_mask=attention_mask
         )
+        out.add_(hidden_states.to(out.device))
 
-        h = hidden_states.to(attn_output.device) + attn_output
-        out = h + self.moe.forward(self.norm_2(h))
-
+        moe_output, _ = self.moe.forward(self.norm_2(out))
+        out.add_(moe_output)
         return out, None, past_key_value
 
 class LlamaLikeBlock(nn.Module):

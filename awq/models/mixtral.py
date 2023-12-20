@@ -1,3 +1,4 @@
+import torch.nn as nn
 import tqdm
 from typing import List, Tuple
 from .base import BaseAWQForCausalLM
@@ -14,6 +15,11 @@ from awq.modules.fused.norm import FasterTransformerRMSNorm
 class MixtralAWQForCausalLM(BaseAWQForCausalLM):
     layer_type = "MixtralDecoderLayer"
     max_new_tokens_key = "max_position_embeddings"
+
+    @staticmethod
+    def fuse_layers(model: OldmixtralForCausalLM):
+        fuser = MixtralFuser(model)
+        fuser.fuse_transformer()
 
     @staticmethod
     def get_model_layers(model: OldmixtralForCausalLM):
@@ -50,28 +56,37 @@ class MixtralAWQForCausalLM(BaseAWQForCausalLM):
                 inp=input_feat['self_attn.o_proj'],
             ))
         
-        # first expert
-        layers.append(dict(
-            prev_op=module.post_attention_layernorm,
-            layers=[module.block_sparse_moe.experts[0].w1,
-                    module.block_sparse_moe.experts[0].w3],
-            inp=input_feat['block_sparse_moe.experts.0.w1'],
-            module2inspect=module.block_sparse_moe.experts[0],
-        ))
-
-        # remaining experts
-        experts = module.block_sparse_moe.experts
-        for i, expert in enumerate(experts[1:]):
-            expert_index = i+1
-
+        # expert
+        for i, expert in enumerate(module.block_sparse_moe.experts):
+            layers.append(dict(
+                prev_op=module.post_attention_layernorm,
+                layers=[
+                    expert.w1,
+                    expert.w3
+                ],
+                inp=input_feat[f"block_sparse_moe.experts.{i}.w1"],
+                module2inspect=expert,
+                kwargs={"routing_weights": input_feat[f"block_sparse_moe.experts.{i}.routing_weights"]}
+            ))
             layers.append(dict(
                 prev_op=expert.w3,
-                layers=[expert.w3, expert.w1],
-                inp=input_feat[f'block_sparse_moe.experts.{expert_index}.w1'],
-                module2inspect=experts[expert_index],
+                layers=[expert.w2],
+                inp=input_feat[f"block_sparse_moe.experts.{i}.w2"],\
             ))
 
         return layers
+
+
+class MixtralMLP(nn.Module):
+    def __init__(self, gate_proj, down_proj, up_proj):
+        super().__init__()
+        self.fused_mlp = QuantFusedMLP(
+            gate_proj=gate_proj,
+            down_proj=down_proj,
+            up_proj=up_proj)
+    
+    def forward(self, hidden_states, routing_weights):
+        return routing_weights * self.fused_mlp(hidden_states)
 
 
 class MixtralFuser:
@@ -97,7 +112,7 @@ class MixtralFuser:
             )
             # Adapt to mixture of experts
             for i in range(len(module.block_sparse_moe.experts)):
-                mlp = QuantFusedMLP(
+                mlp = MixtralMLP(
                     gate_proj=module.block_sparse_moe.experts[i].w1,
                     down_proj=module.block_sparse_moe.experts[i].w2,
                     up_proj=module.block_sparse_moe.experts[i].w3
@@ -117,17 +132,16 @@ class MixtralFuser:
                 n_kv_heads=self.model.config.num_key_value_heads,
                 qkv_layer=qkv,
                 o_proj=module.self_attn.o_proj,
-                moe=module.block_sparse_moe.experts,
+                moe=module.block_sparse_moe,
                 norm_1=norm_1,
                 norm_2=norm_2,
                 dev=device,
                 max_seq_len=self.model.config.max_new_tokens
             ))
-        
+
         self.model.model = LlamaLikeModel(
             self.model.config.vocab_size,
             blocks,
             self.model.model.embed_tokens,
             self.model.model.norm,
         )
-

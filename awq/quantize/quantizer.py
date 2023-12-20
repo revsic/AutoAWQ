@@ -153,7 +153,13 @@ class AwqQuantizer:
             kwargs.pop("use_cache")
         
         # Put x on the right device
-        inp = inp.to(next(module2inspect.parameters()).device)
+        device = next(module2inspect.parameters()).device
+        inp = inp.to(device)
+        if "routing_weights" in kwargs:
+            kwargs = {
+                **kwargs,
+                "routing_weights": kwargs["routing_weights"].to(device)
+            }
 
         # [STEP 1]: Compute maximum of weight
         weight = torch.cat([_m.weight for _m in layers], dim=0)
@@ -383,6 +389,19 @@ class AwqQuantizer:
 
         input_feat = defaultdict(list)
         handles = []
+        ### HARDCODE
+        def _cache_routing_weights(m, x, _, name, feat_dict):
+            _, routing_weights = x
+            feat_dict[name].append(routing_weights.detach().cpu())
+
+        for i, expert in enumerate(layer.block_sparse_moe.experts):
+            handles.append(
+                expert.register_forward_hook(
+                    functools.partial(
+                        _cache_routing_weights,
+                        name=f"block_sparse_moe.experts.{i}.routing_weights",
+                        feat_dict=input_feat)))
+        ####
         for name in named_linears:
             handles.append(named_linears[name].register_forward_hook(
                 functools.partial(cache_input_hook, name=name,
